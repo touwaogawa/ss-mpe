@@ -29,7 +29,7 @@ import os
 
 DEBUG = 0 # (0 - off | 1 - on)
 CONFIG = 0 # (0 - desktop | 1 - lab)
-EX_NAME = '_'.join(['<EXPERIMENT_NAME>'])
+EX_NAME = '_'.join(['reproduce', 'v0.1.0', 'full'])
 
 ex = Experiment('Train a model to perform MPE with self-supervised objectives only')
 
@@ -292,6 +292,18 @@ def train_model(checkpoint_path, max_epochs, checkpoint_interval, batch_size, n_
                         cqt=model.hcqt,
                         seed=seed)
 
+    # NOTE: URMP and Bach10 cannot be downloaded automatically, so they are skipped
+    # (with a warning) until placed manually; this does not affect checkpoint selection,
+    # which only depends on NSynth validation loss (see validation_criteria_set)
+    def dataset_available(dataset_cls, base_dir):
+        path = base_dir if base_dir is not None else os.path.join(constants.DEFAULT_LOCATION, dataset_cls.name())
+        if not os.path.isdir(path):
+            warnings.warn(f'Skipping {dataset_cls.name()} since it was not found at \'{path}\'...', RuntimeWarning)
+        return os.path.isdir(path)
+
+    urmp_available = dataset_available(URMP_Mixtures, urmp_base_dir)
+    bch10_available = dataset_available(Bach10_Mixtures, bch10_base_dir)
+
     # Set the URMP validation set as was defined in the MT3 paper
     urmp_val_splits = ['01', '02', '12', '13', '24', '25', '31', '38', '39']
     # Instantiate URMP dataset mixtures for validation
@@ -299,7 +311,7 @@ def train_model(checkpoint_path, max_epochs, checkpoint_interval, batch_size, n_
                              splits=urmp_val_splits,
                              sample_rate=sample_rate,
                              cqt=model.hcqt,
-                             seed=seed)
+                             seed=seed) if urmp_available else None
 
     # Instantiate NSynth testing split for evaluation
     nsynth_test = NSynth(base_dir=nsynth_base_dir,
@@ -313,14 +325,14 @@ def train_model(checkpoint_path, max_epochs, checkpoint_interval, batch_size, n_
                                  splits=None,
                                  sample_rate=sample_rate,
                                  cqt=model.hcqt,
-                                 seed=seed)
+                                 seed=seed) if bch10_available else None
 
     # Instantiate URMP dataset mixtures for evaluation
     urmp_test = URMP_Mixtures(base_dir=urmp_base_dir,
                               splits=None,
                               sample_rate=sample_rate,
                               cqt=model.hcqt,
-                              seed=seed)
+                              seed=seed) if urmp_available else None
 
     # Instantiate TRIOS dataset for evaluation
     trios_test = TRIOS(base_dir=trios_base_dir,
@@ -341,10 +353,10 @@ def train_model(checkpoint_path, max_epochs, checkpoint_interval, batch_size, n_
     # (Li Su's Google Site) has required Google sign-in since at least 2022-12
     # and could not be obtained; training is unaffected since the checkpoint
     # selection criterion is NSynth validation loss only (see validation_criteria_set)
-    validation_sets = [nsynth_val, urmp_val, bch10_test, trios_test]
+    validation_sets = [d for d in [nsynth_val, urmp_val, bch10_test, trios_test] if d is not None]
 
     # Add all evaluation datasets to a list
-    evaluation_sets = [nsynth_test, bch10_test, trios_test, urmp_test, gset_test]
+    evaluation_sets = [d for d in [nsynth_test, bch10_test, trios_test, urmp_test, gset_test] if d is not None]
 
     #################
     ## PREPARATION ##
