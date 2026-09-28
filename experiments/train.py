@@ -1,7 +1,7 @@
 # Author: Frank Cwitkowitz <fcwitkow@ur.rochester.edu>
 
 # My imports
-from timbre_trap.datasets.MixedMultiPitch import URMP as URMP_Mixtures, Bach10 as Bach10_Mixtures, Su, TRIOS
+from timbre_trap.datasets.MixedMultiPitch import URMP as URMP_Mixtures, Bach10 as Bach10_Mixtures, TRIOS
 from timbre_trap.datasets.SoloMultiPitch import GuitarSet
 from timbre_trap.datasets import ComboDataset
 
@@ -245,7 +245,6 @@ def train_model(checkpoint_path, max_epochs, checkpoint_interval, batch_size, n_
     gset_base_dir      = os.path.join('/', 'storage', 'frank', 'GuitarSet') if CONFIG else None
     mstro_base_dir     = os.path.join('/', 'storage', 'frank', 'MAESTRO') if CONFIG else None
     swd_base_dir       = os.path.join('/', 'storage', 'frank', 'SWD') if CONFIG else None
-    su_base_dir        = os.path.join('/', 'storage', 'frank', 'Su') if CONFIG else None
     trios_base_dir     = os.path.join('/', 'storage', 'frank', 'TRIOS') if CONFIG else None
 
     # Initialize list to hold all training datasets
@@ -316,13 +315,6 @@ def train_model(checkpoint_path, max_epochs, checkpoint_interval, batch_size, n_
                                  cqt=model.hcqt,
                                  seed=seed)
 
-    # Instantiate Su dataset for evaluation
-    su_test = Su(base_dir=su_base_dir,
-                 splits=None,
-                 sample_rate=sample_rate,
-                 cqt=model.hcqt,
-                 seed=seed)
-
     # Instantiate URMP dataset mixtures for evaluation
     urmp_test = URMP_Mixtures(base_dir=urmp_base_dir,
                               splits=None,
@@ -345,10 +337,14 @@ def train_model(checkpoint_path, max_epochs, checkpoint_interval, batch_size, n_
                           seed=seed)
 
     # Add all validation datasets to a list
-    validation_sets = [nsynth_val, urmp_val, bch10_test, su_test, trios_test]
+    # NOTE: Su excluded because the dataset's only official distribution page
+    # (Li Su's Google Site) has required Google sign-in since at least 2022-12
+    # and could not be obtained; training is unaffected since the checkpoint
+    # selection criterion is NSynth validation loss only (see validation_criteria_set)
+    validation_sets = [nsynth_val, urmp_val, bch10_test, trios_test]
 
     # Add all evaluation datasets to a list
-    evaluation_sets = [nsynth_test, bch10_test, su_test, trios_test, urmp_test, gset_test]
+    evaluation_sets = [nsynth_test, bch10_test, trios_test, urmp_test, gset_test]
 
     #################
     ## PREPARATION ##
