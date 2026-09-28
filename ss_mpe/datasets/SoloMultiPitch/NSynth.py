@@ -191,7 +191,10 @@ class NSynth(AMTDataset):
         # Compute RMS window
         w = torch.ones(w_length)
         # Compute discrete RMS values for filtered signal
-        rms = torch.sqrt((1 / w_length) * F.convolve(audio_highpass ** 2, w, 'same'))
+        # NOTE: fftconvolve instead of convolve, since direct convolution with the
+        # 2205-sample window took ~1.4s per track and bottlenecked data loading
+        # (clamped since FFT round-off can yield tiny negatives in silent regions)
+        rms = torch.sqrt((1 / w_length) * F.fftconvolve(audio_highpass ** 2, w, 'same').clamp(min=0))
         # Low-pass filter RMS values to obtain amplitude envelope
         amplitude = F.lowpass_biquad(rms, self.sample_rate, cutoff_freq=30)
 
