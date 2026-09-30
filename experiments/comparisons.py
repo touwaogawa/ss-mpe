@@ -1,7 +1,7 @@
 # Author: Frank Cwitkowitz <fcwitkow@ur.rochester.edu>
 
 # My imports
-from timbre_trap.datasets.MixedMultiPitch import Bach10, URMP, Su, TRIOS
+from timbre_trap.datasets.MixedMultiPitch import Bach10, URMP, TRIOS
 from timbre_trap.datasets.SoloMultiPitch import GuitarSet
 from timbre_trap.datasets.NoteDataset import NoteDataset
 from ss_mpe.datasets.SoloMultiPitch import NSynth
@@ -18,21 +18,15 @@ import os
 
 
 # Name of the model to evaluate
-ex_name = '<EXPERIMENT_DIR>'
-#ex_name = 'SS-MPE'
-#ex_name = 'Timbre'
-#ex_name = 'Geometric'
-#ex_name = 'Energy'
+ex_name = 'reproduce_v0.1.0_full'
 
-# Choose the model checkpoint to compare
-checkpoint = 0
-#checkpoint = 37000
-#checkpoint = 41750
-#checkpoint = 37000
-#checkpoint = 43000
+# Choose the model checkpoint to compare (best by NSynth validation loss)
+checkpoint = 28000
 
 # Choose the GPU on which to perform evaluation
-gpu_id = None
+# NOTE: NVIDIA_VISIBLE_DEVICES restricts the container to one GPU, which then
+# always appears as cuda:0 inside the container regardless of the host index.
+gpu_id = 0
 
 # Flag to print results for each track separately
 verbose = True
@@ -84,7 +78,6 @@ ss_mpe.eval()
 nsynth_base_dir    = os.path.join('/', 'storageNVME', 'frank', 'NSynth') if path_layout else None
 bch10_base_dir     = os.path.join('/', 'storage', 'frank', 'Bach10') if path_layout else None
 urmp_base_dir      = os.path.join('/', 'storage', 'frank', 'URMP') if path_layout else None
-su_base_dir        = os.path.join('/', 'storage', 'frank', 'Su') if path_layout else None
 trios_base_dir     = os.path.join('/', 'storage', 'frank', 'TRIOS') if path_layout else None
 gset_base_dir      = os.path.join('/', 'storage', 'frank', 'GuitarSet') if path_layout else None
 
@@ -108,11 +101,8 @@ urmp_test = URMP(base_dir=urmp_base_dir,
                  sample_rate=sample_rate,
                  cqt=ss_mpe.hcqt)
 
-# Instantiate Su dataset for evaluation
-su_test = Su(base_dir=su_base_dir,
-             splits=None,
-             sample_rate=sample_rate,
-             cqt=ss_mpe.hcqt)
+# NOTE: Su is excluded — its download() is unimplemented (manual-only source
+# that requires a Google login) and the dataset was never obtained; see CLAUDE.md
 
 # Instantiate TRIOS dataset for evaluation
 trios_test = TRIOS(base_dir=trios_base_dir,
@@ -145,7 +135,7 @@ if os.path.exists(save_path):
     os.remove(save_path)
 
 # Loop through validation and evaluation datasets
-for eval_set in [nsynth_val, bch10_test, urmp_test, su_test, trios_test, gset_test]:
+for eval_set in [nsynth_val, bch10_test, urmp_test, trios_test, gset_test]:
     # Initialize evaluators for each algorithm/model
     ln1_evaluator = MultipitchEvaluator()
     lg1_evaluator = MultipitchEvaluator()
