@@ -27,15 +27,17 @@ import math
 import os
 
 
-DEBUG = 0 # (0 - off | 1 - on)
+DEBUG = int(os.environ.get('DEBUG', 0)) # (0 - off | 1 - on)
 CONFIG = 0 # (0 - desktop | 1 - lab)
-EX_NAME = '_'.join(['reproduce', 'v0.1.0', 'full'])
 
 ex = Experiment('Train a model to perform MPE with self-supervised objectives only')
 
 
 @ex.config
 def config():
+    # Name of the experiment (e.g., python train.py with ex_name=<name> multipliers.sparsity=2)
+    ex_name = '_'.join(['reproduce', 'v0.1.0', 'full'])
+
     ##############################
     ## TRAINING HYPERPARAMETERS ##
     ##############################
@@ -48,6 +50,9 @@ def config():
 
     # Number of iterations between checkpoints
     checkpoint_interval = 250
+
+    # Number of checkpoints between validation on datasets other than the criteria set
+    validation_stride = 4
 
     # Number of samples to gather for a batch
     batch_size = 4 if DEBUG else 20
@@ -71,8 +76,16 @@ def config():
         'sparsity' : 1,
         'timbre' : 1,
         'geometric' : 1,
-        'supervised' : 0
+        'supervised' : 0,
+        'overtone' : 0,
+        'smoothness' : 0,
+        'noise' : 0,
+        'vibrato' : 0,
+        'mixture' : 0
     }
+
+    # Whether to stop gradients through the targets of the consistency objectives
+    detach_targets = False
 
     # Number of epochs spanning warmup phase (0 to disable)
     n_epochs_warmup = 0
@@ -135,9 +148,9 @@ def config():
 
     # Top-level directory under which to save all experiment files
     if CONFIG == 1:
-        root_dir = os.path.join('/', 'storage', 'frank', 'self-supervised-pitch', EX_NAME)
+        root_dir = os.path.join('/', 'storage', 'frank', 'self-supervised-pitch', ex_name)
     else:
-        root_dir = os.path.join('..', 'generated', 'experiments', EX_NAME)
+        root_dir = os.path.join('..', 'generated', 'experiments', ex_name)
 
     # Create the root directory
     os.makedirs(root_dir, exist_ok=True)
@@ -151,8 +164,8 @@ def config():
 
 
 @ex.automain
-def train_model(checkpoint_path, max_epochs, checkpoint_interval, batch_size, n_secs, learning_rates,
-                multipliers, n_epochs_warmup, validation_criteria_set, validation_criteria_metric,
+def train_model(checkpoint_path, max_epochs, checkpoint_interval, validation_stride, batch_size, n_secs, learning_rates,
+                multipliers, detach_targets, n_epochs_warmup, validation_criteria_set, validation_criteria_metric,
                 validation_criteria_maximize, n_epochs_late_start, n_epochs_decay, n_epochs_cooldown,
                 n_epochs_early_stop, gpu_ids, seed, sample_rate, hop_length, fmin, bins_per_octave,
                 n_bins, harmonics, n_workers, root_dir):
@@ -502,6 +515,42 @@ def train_model(checkpoint_path, max_epochs, checkpoint_interval, batch_size, n_
         'max_stretch_factor' : max_stretch_factor
     }
 
+    ################
+    ## NOISE LOSS ##
+    ################
+
+    # Set keyword arguments for additive noise (signal-to-noise ratio in dB)
+    ns_kwargs = {
+        'min_snr' : 10,
+        'max_snr' : 40
+    }
+
+    ##################
+    ## VIBRATO LOSS ##
+    ##################
+
+    # Number of frames per second of audio
+    frame_rate = sample_rate / hop_length
+
+    # Set keyword arguments for time-varying frequency shifts
+    vb_kwargs = {
+        # Maximum deviation of half a semitone
+        'max_depth' : 0.5 * bins_per_semitone,
+        # Modulation rate between 3 and 8 Hz
+        'min_rate' : 3 / frame_rate,
+        'max_rate' : 8 / frame_rate
+    }
+
+    ##################
+    ## MIXTURE LOSS ##
+    ##################
+
+    # Set keyword arguments for mixtures of batch entries
+    mx_kwargs = {
+        'max_sources' : 3,
+        'max_attenuation' : 12
+    }
+
     ##############################
     ## TRAINING/VALIDATION LOOP ##
     ##############################
@@ -554,12 +603,12 @@ def train_model(checkpoint_path, max_epochs, checkpoint_interval, batch_size, n_
                 writer.add_scalar('train/loss/sparsity', sparsity_loss.item(), batch_count)
 
                 # Compute timbre-invariance loss for the batch
-                timbre_loss = compute_timbre_loss(model, features_db, logits, eq_fn, **eq_kwargs)
+                timbre_loss = compute_timbre_loss(model, features_db, logits, eq_fn, detach=detach_targets, **eq_kwargs)
                 # Log the timbre-invariance loss for this batch
                 writer.add_scalar('train/loss/timbre', timbre_loss.item(), batch_count)
 
                 # Compute geometric-invariance loss for the batch
-                geometric_loss = compute_geometric_loss(model, features_db, logits, **gm_kwargs)
+                geometric_loss = compute_geometric_loss(model, features_db, logits, detach=detach_targets, **gm_kwargs)
                 # Log the geometric-invariance loss for this batch
                 writer.add_scalar('train/loss/geometric', geometric_loss.item(), batch_count)
 
@@ -578,10 +627,45 @@ def train_model(checkpoint_path, max_epochs, checkpoint_interval, batch_size, n_
                              multipliers['geometric'] * geometric_loss + \
                              multipliers['supervised'] * supervised_loss
 
-                if i >= n_epochs_late_start:
-                    # Currently no late-state losses
-                    # TODO - remove if unnecessary
-                    pass
+                if multipliers['overtone']:
+                    # Compute overtone loss for the batch
+                    overtone_loss = compute_overtone_loss(estimate, bins_per_octave)
+                    # Log the overtone loss for this batch
+                    writer.add_scalar('train/loss/overtone', overtone_loss.item(), batch_count)
+                    # Add the overtone loss to the total loss
+                    total_loss += multipliers['overtone'] * overtone_loss
+
+                if multipliers['smoothness']:
+                    # Compute temporal smoothness loss for the batch
+                    smoothness_loss = compute_smoothness_loss(estimate)
+                    # Log the temporal smoothness loss for this batch
+                    writer.add_scalar('train/loss/smoothness', smoothness_loss.item(), batch_count)
+                    # Add the temporal smoothness loss to the total loss
+                    total_loss += multipliers['smoothness'] * smoothness_loss
+
+                if multipliers['noise']:
+                    # Compute noise-invariance loss for the batch
+                    noise_loss = compute_noise_loss(model, audio, logits, detach=detach_targets, **ns_kwargs)
+                    # Log the noise-invariance loss for this batch
+                    writer.add_scalar('train/loss/noise', noise_loss.item(), batch_count)
+                    # Add the noise-invariance loss to the total loss
+                    total_loss += multipliers['noise'] * noise_loss
+
+                if multipliers['vibrato']:
+                    # Compute vibrato-equivariance loss for the batch
+                    vibrato_loss = compute_vibrato_loss(model, features_db, logits, detach=detach_targets, **vb_kwargs)
+                    # Log the vibrato-equivariance loss for this batch
+                    writer.add_scalar('train/loss/vibrato', vibrato_loss.item(), batch_count)
+                    # Add the vibrato-equivariance loss to the total loss
+                    total_loss += multipliers['vibrato'] * vibrato_loss
+
+                if multipliers['mixture']:
+                    # Compute mixture-consistency loss for the batch
+                    mixture_loss = compute_mixture_loss(model, audio, logits, **mx_kwargs)
+                    # Log the mixture-consistency loss for this batch
+                    writer.add_scalar('train/loss/mixture', mixture_loss.item(), batch_count)
+                    # Add the mixture-consistency loss to the total loss
+                    total_loss += multipliers['mixture'] * mixture_loss
 
                 for key_loss, val_loss in losses.items():
                     # Log the model loss for this batch
@@ -635,6 +719,11 @@ def train_model(checkpoint_path, max_epochs, checkpoint_interval, batch_size, n_
                 validation_results = dict()
 
                 for val_set in validation_sets:
+                    if val_set.name() != validation_criteria_set and \
+                            batch_count % (validation_stride * checkpoint_interval):
+                        # Only validate on criteria set for this checkpoint
+                        continue
+
                     # Validate the model checkpoint on each validation dataset
                     validation_results[val_set.name()] = evaluate(model=model,
                                                                   eval_set=val_set,
@@ -644,7 +733,9 @@ def train_model(checkpoint_path, max_epochs, checkpoint_interval, batch_size, n_
                                                                   device=device,
                                                                   eq_fn=eq_fn,
                                                                   eq_kwargs=eq_kwargs,
-                                                                  gm_kwargs=gm_kwargs)
+                                                                  gm_kwargs=gm_kwargs,
+                                                                  ns_kwargs=ns_kwargs,
+                                                                  vb_kwargs=vb_kwargs)
 
                 # Make sure model is on correct device and switch to training mode
                 model = model.to(device)
@@ -693,6 +784,10 @@ def train_model(checkpoint_path, max_epochs, checkpoint_interval, batch_size, n_
     print(f'Achieved best results at {best_model_checkpoint} iterations...')
 
     for val_set in validation_sets:
+        if val_set.name() not in best_results:
+            # Dataset was not validated at the best checkpoint
+            continue
+
         # Log the results at the best checkpoint for each validation dataset in metrics.json
         ex.log_scalar(f'Validation Results ({val_set.name()})', best_results[val_set.name()], best_model_checkpoint)
 
@@ -718,7 +813,9 @@ def train_model(checkpoint_path, max_epochs, checkpoint_interval, batch_size, n_
                                  device=device,
                                  eq_fn=eq_fn,
                                  eq_kwargs=eq_kwargs,
-                                 gm_kwargs=gm_kwargs)
+                                 gm_kwargs=gm_kwargs,
+                                 ns_kwargs=ns_kwargs,
+                                 vb_kwargs=vb_kwargs)
 
         # Log the evaluation results for this dataset in metrics.json
         ex.log_scalar(f'Evaluation Results ({eval_set.name()})', final_results, best_model_checkpoint)

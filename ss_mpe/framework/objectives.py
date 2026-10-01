@@ -2,6 +2,7 @@
 
 import torch.nn.functional as F
 import torch
+import math
 
 
 __all__ = [
@@ -13,7 +14,12 @@ __all__ = [
     'sample_gaussian_equalization',
     'compute_timbre_loss',
     'compute_geometric_loss',
-    'compute_supervised_loss'
+    'compute_supervised_loss',
+    'compute_overtone_loss',
+    'compute_smoothness_loss',
+    'compute_noise_loss',
+    'compute_vibrato_loss',
+    'compute_mixture_loss'
 ]
 
 
@@ -217,7 +223,7 @@ def apply_random_eq(features, hcqt, eq_fn, **eq_kwargs):
     return equalized_features
 
 
-def compute_timbre_loss(model, features, embeddings, eq_fn, **eq_kwargs):
+def compute_timbre_loss(model, features, embeddings, eq_fn, detach=False, **eq_kwargs):
     # Perform random equalizations on batch of features
     equalized_features = apply_random_eq(features, model.hcqt, eq_fn, **eq_kwargs)
 
@@ -226,6 +232,10 @@ def compute_timbre_loss(model, features, embeddings, eq_fn, **eq_kwargs):
 
     # Convert both sets of logits to activations (implicit pitch salience)
     original_salience, equalization_salience = torch.sigmoid(embeddings), torch.sigmoid(equalization_embeddings)
+
+    if detach:
+        # Treat original activations as fixed targets
+        original_salience = original_salience.detach()
 
     # Compute timbre loss as BCE of embeddings computed from equalized features with respect to original activations
     timbre_loss = F.binary_cross_entropy_with_logits(equalization_embeddings, original_salience, reduction='none')
@@ -326,7 +336,7 @@ def apply_distortion(tensor, stretch_factors):
     return distorted
 
 
-def compute_geometric_loss(model, features, embeddings, max_shift_v, max_shift_h, max_stretch_factor):
+def compute_geometric_loss(model, features, embeddings, max_shift_v, max_shift_h, max_stretch_factor, detach=False):
     # Determine batch size
     B = features.size(0)
 
@@ -358,6 +368,10 @@ def compute_geometric_loss(model, features, embeddings, max_shift_v, max_shift_h
     # Convert logits to activations (implicit pitch salience)
     salience = torch.sigmoid(embeddings).unsqueeze(-3)
 
+    if detach:
+        # Treat original activations as fixed targets
+        salience = salience.detach()
+
     # Apply same transformations to activations produced for original features
     transformed_salience = apply_translation(salience, v_shifts, axis=-2, val=0)
     transformed_salience = apply_translation(transformed_salience, h_shifts, axis=-1, val=0)
@@ -383,3 +397,304 @@ def compute_supervised_loss(embeddings, ground_truth):
     supervised_loss = supervised_loss.sum(-2).mean(-1).mean(-1)
 
     return supervised_loss
+
+
+def compute_overtone_loss(activations, bins_per_octave, harmonics=(2, 3, 4, 5), tolerance=1):
+    """
+    Penalize activations located at overtones of other activations.
+
+    Parameters
+    ----------
+    activations : Tensor (B x F x T)
+      Batch of (implicit) pitch salience activations
+    bins_per_octave : int
+      Number of frequency bins per octave
+    harmonics : tuple of int
+      Overtones (multiples of fundamental) to penalize
+    tolerance : int
+      Number of neighboring bins (each side) considered for the fundamental
+
+    Returns
+    ----------
+    overtone_loss : Tensor (1)
+      Co-activation of fundamentals and their overtones
+    """
+
+    # Treat lower activations as fixed so only the overtones are suppressed
+    fundamentals = activations.detach()
+
+    if tolerance:
+        # Take maximum over neighboring bins to account for rounded offsets
+        fundamentals = F.max_pool1d(fundamentals.transpose(-1, -2),
+                                    kernel_size=2 * tolerance + 1,
+                                    stride=1,
+                                    padding=tolerance).transpose(-1, -2)
+
+    # Initialize the loss for each frame
+    overtone_loss = 0
+
+    for h in harmonics:
+        # Determine the bin offset corresponding to the overtone
+        offset = round(bins_per_octave * math.log2(h))
+
+        if offset >= activations.size(-2):
+            # Overtone is outside of frequency support
+            continue
+
+        # Compute co-activation of each bin with its overtone and sum across frequency bins
+        overtone_loss += (fundamentals[..., :-offset, :] * activations[..., offset:, :]).sum(-2)
+
+    # Average loss across time and batch
+    overtone_loss = overtone_loss.mean(-1).mean(-1)
+
+    return overtone_loss
+
+
+def compute_smoothness_loss(activations):
+    """
+    Penalize differences between the activations of adjacent frames.
+
+    Parameters
+    ----------
+    activations : Tensor (B x F x T)
+      Batch of (implicit) pitch salience activations
+
+    Returns
+    ----------
+    smoothness_loss : Tensor (1)
+      Total variation of activations along time
+    """
+
+    # Compute absolute difference between adjacent frames
+    smoothness_loss = (activations[..., 1:] - activations[..., :-1]).abs()
+
+    # Sum across frequency bins and average across time and batch
+    smoothness_loss = smoothness_loss.sum(-2).mean(-1).mean(-1)
+
+    return smoothness_loss
+
+
+def extract_features(model, audio):
+    """
+    Compute input features for audio outside of the computational graph.
+
+    Parameters
+    ----------
+    model : SS_MPE
+      Model with feature extraction module
+    audio : Tensor (B x 1 x N)
+      Batch of input raw audio
+
+    Returns
+    ----------
+    features : Tensor (B x H x F x T)
+      Batch of HCQT spectral features (dB) scaled to [0, 1]
+    """
+
+    with torch.no_grad(), torch.autocast(device_type=audio.device.type, enabled=False):
+        # Compute features at full precision
+        features = model.get_all_features(audio.float())['db']
+
+    return features
+
+
+def apply_random_noise(audio, min_snr=10, max_snr=40):
+    """
+    Add white noise with an independent signal-to-noise ratio to each entry of a batch.
+
+    Parameters
+    ----------
+    audio : Tensor (B x 1 x N)
+      Batch of input raw audio
+    min_snr : float
+      Minimum signal-to-noise ratio (dB)
+    max_snr : float
+      Maximum signal-to-noise ratio (dB)
+
+    Returns
+    ----------
+    noisy_audio : Tensor (B x 1 x N)
+      Batch of audio with added noise
+    """
+
+    # Determine batch size and appropriate device
+    B, device = audio.size(0), audio.device
+
+    # Sample a random signal-to-noise ratio for each sample in the batch
+    snrs = min_snr + (max_snr - min_snr) * torch.rand(size=(B, 1, 1), device=device)
+
+    # Compute root-mean-square amplitude of each sample in the batch
+    rms = audio.pow(2).mean(-1, keepdim=True).sqrt()
+
+    # Sample white noise and scale to obtain chosen signal-to-noise ratio
+    noise = torch.randn_like(audio) * rms * 10 ** (-snrs / 20)
+
+    # Add noise to the original audio
+    noisy_audio = audio + noise
+
+    return noisy_audio
+
+
+def compute_noise_loss(model, audio, embeddings, min_snr=10, max_snr=40, detach=False):
+    # Add random noise to batch of audio
+    noisy_audio = apply_random_noise(audio, min_snr, max_snr)
+
+    # Process features for noisy audio with provided model
+    noise_embeddings = model(extract_features(model, noisy_audio))[0]
+
+    # Convert logits to activations (implicit pitch salience)
+    original_salience = torch.sigmoid(embeddings)
+
+    if detach:
+        # Treat original activations as fixed targets
+        original_salience = original_salience.detach()
+
+    # Compute noise loss as BCE of embeddings computed from noisy audio with respect to original activations
+    noise_loss = F.binary_cross_entropy_with_logits(noise_embeddings, original_salience, reduction='none')
+
+    # Sum across frequency bins and average across time and batch
+    noise_loss = noise_loss.sum(-2).mean(-1).mean(-1)
+
+    return noise_loss
+
+
+def apply_vibrato(tensor, depths, rates, phases):
+    """
+    Perform an independent time-varying frequency shift on each entry of a tensor.
+
+    Parameters
+    ----------
+    tensor : Tensor (B x C x F x T)
+      Input tensor with standard 4 dimensions
+    depths : Tensor (B)
+      Maximum deviation (bins) of each shift
+    rates : Tensor (B)
+      Modulation rate (cycles per frame) of each shift
+    phases : Tensor (B)
+      Initial phase (radians) of each shift
+
+    Returns
+    ----------
+    modulated : Tensor (B x C x F x T)
+      Original tensor shifted along frequency by sinusoidal amount
+    """
+
+    # Determine dimensionality and device of input tensor
+    (B, C, K, T), device = tensor.size(), tensor.device
+
+    # Create a Tensor of indices for the frames of each entry
+    t = torch.arange(T, device=device).unsqueeze(0)
+
+    # Compute frequency shift (bins) for each frame
+    shifts = depths.unsqueeze(-1) * torch.sin(2 * math.pi * rates.unsqueeze(-1) * t + phases.unsqueeze(-1))
+
+    # Determine the (fractional) source bin for each frequency bin and frame
+    source = torch.arange(K, device=device).view(1, K, 1) - shifts.unsqueeze(-2)
+
+    # Split source bins into lower index and interpolation weight
+    lower = source.floor()
+    weight = (source - lower).unsqueeze(1).to(tensor.dtype)
+    lower = lower.long()
+
+    def gather(idcs):
+        # Determine which indices fall within frequency support
+        valid = ((idcs >= 0) & (idcs < K)).unsqueeze(1)
+        # Broadcast clamped indices across channels
+        idcs = idcs.clamp(0, K - 1).unsqueeze(1).expand(B, C, K, T)
+        # Obtain values for each index, inserting zero outside of support
+        return torch.gather(tensor, -2, idcs) * valid
+
+    # Linearly interpolate between the two nearest bins
+    modulated = (1 - weight) * gather(lower) + weight * gather(lower + 1)
+
+    return modulated
+
+
+def compute_vibrato_loss(model, features, embeddings, max_depth, min_rate, max_rate, detach=False):
+    # Determine batch size and appropriate device
+    B, device = features.size(0), features.device
+
+    # Sample a random depth, rate, and phase for each sample in the batch
+    depths, rates, phases = torch.rand(size=(3, B), device=device)
+    # Scale parameters to appropriate ranges
+    depths, rates, phases = max_depth * depths, min_rate + (max_rate - min_rate) * rates, 2 * math.pi * phases
+
+    # Apply time-varying frequency shift to batch of features
+    modulated_features = apply_vibrato(features, depths, rates, phases)
+
+    # Process modulated features with provided model
+    modulation_embeddings = model(modulated_features)[0]
+
+    # Convert logits to activations (implicit pitch salience)
+    salience = torch.sigmoid(embeddings).unsqueeze(-3)
+
+    if detach:
+        # Treat original activations as fixed targets
+        salience = salience.detach()
+
+    # Apply same modulation to activations produced for original features
+    modulated_salience = apply_vibrato(salience.float(), depths, rates, phases).squeeze(-3)
+
+    # Compute vibrato loss as BCE of embeddings computed from modulated features with respect to modulated activations
+    vibrato_loss = F.binary_cross_entropy_with_logits(modulation_embeddings, modulated_salience, reduction='none')
+
+    # Sum across frequency bins and average across time and batch
+    vibrato_loss = vibrato_loss.sum(-2).mean(-1).mean(-1)
+
+    return vibrato_loss
+
+
+def compute_mixture_loss(model, audio, embeddings, max_sources=3, max_attenuation=12):
+    """
+    Compute BCE between activations for mixtures of the batch and the
+    maximum of the activations produced for the individual sources.
+
+    Parameters
+    ----------
+    model : SS_MPE
+      Model to process mixtures
+    audio : Tensor (B x 1 x N)
+      Batch of input raw audio
+    embeddings : Tensor (B x F x T)
+      Batch of logits produced for the original audio
+    max_sources : int
+      Maximum number of entries to combine in each mixture
+    max_attenuation : float
+      Maximum attenuation (dB) applied to each additional source
+
+    Returns
+    ----------
+    mixture_loss : Tensor (1)
+      Disagreement between mixture and combined source activations
+    """
+
+    # Determine batch size and appropriate device
+    B, device = audio.size(0), audio.device
+
+    # Individual source activations serve as fixed targets
+    salience = torch.sigmoid(embeddings).detach()
+
+    # Sample the number of sources to combine
+    n_sources = torch.randint(low=2, high=max(2, min(max_sources, B)) + 1, size=(1,)).item()
+
+    # Start with original batch
+    mixtures, targets = audio.clone(), salience
+
+    for i in range(1, n_sources):
+        # Sample a random attenuation for each additional source
+        gains = 10 ** (-max_attenuation * torch.rand(size=(B, 1, 1), device=device) / 20)
+        # Add another entry of the batch to each mixture
+        mixtures = mixtures + gains * audio.roll(i, 0)
+        # Any pitch active within a source is active within the mixture
+        targets = torch.maximum(targets, salience.roll(i, 0))
+
+    # Process features for mixtures with provided model
+    mixture_embeddings = model(extract_features(model, mixtures))[0]
+
+    # Compute mixture loss as BCE of embeddings computed from mixtures with respect to combined activations
+    mixture_loss = F.binary_cross_entropy_with_logits(mixture_embeddings, targets, reduction='none')
+
+    # Sum across frequency bins and average across time and batch
+    mixture_loss = mixture_loss.sum(-2).mean(-1).mean(-1)
+
+    return mixture_loss

@@ -10,7 +10,8 @@ import librosa
 import torch
 
 
-def evaluate(model, eval_set, multipliers, writer=None, i=0, device='cpu', eq_fn=None, eq_kwargs={}, gm_kwargs={}):
+def evaluate(model, eval_set, multipliers, writer=None, i=0, device='cpu', eq_fn=None, eq_kwargs={}, gm_kwargs={},
+             ns_kwargs={}, vb_kwargs={}):
     # Initialize a new evaluator for the dataset
     evaluator = MultipitchEvaluator()
 
@@ -96,6 +97,40 @@ def evaluate(model, eval_set, multipliers, writer=None, i=0, device='cpu', eq_fn
             evaluator.append_results({'loss/geometric' : geometric_loss.item()})
             # Add the geometric loss to the total loss
             total_loss += multipliers['geometric'] * geometric_loss
+
+            # NOTE: mixture loss requires multiple tracks, so it is not represented in the validation loss
+
+            if multipliers.get('overtone', 0):
+                # Compute overtone loss for the track
+                overtone_loss = compute_overtone_loss(transcription, model.hcqt.bins_per_octave)
+                # Store the overtone loss for the track
+                evaluator.append_results({'loss/overtone' : overtone_loss.item()})
+                # Add the overtone loss to the total loss
+                total_loss += multipliers['overtone'] * overtone_loss
+
+            if multipliers.get('smoothness', 0):
+                # Compute temporal smoothness loss for the track
+                smoothness_loss = compute_smoothness_loss(transcription)
+                # Store the temporal smoothness loss for the track
+                evaluator.append_results({'loss/smoothness' : smoothness_loss.item()})
+                # Add the temporal smoothness loss to the total loss
+                total_loss += multipliers['smoothness'] * smoothness_loss
+
+            if multipliers.get('noise', 0):
+                # Compute noise-invariance loss for the track
+                noise_loss = compute_noise_loss(model, audio, logits, **ns_kwargs)
+                # Store the noise-invariance loss for the track
+                evaluator.append_results({'loss/noise' : noise_loss.item()})
+                # Add the noise-invariance loss to the total loss
+                total_loss += multipliers['noise'] * noise_loss
+
+            if multipliers.get('vibrato', 0):
+                # Compute vibrato-equivariance loss for the track
+                vibrato_loss = compute_vibrato_loss(model, features_db, logits, **vb_kwargs)
+                # Store the vibrato-equivariance loss for the track
+                evaluator.append_results({'loss/vibrato' : vibrato_loss.item()})
+                # Add the vibrato-equivariance loss to the total loss
+                total_loss += multipliers['vibrato'] * vibrato_loss
 
             for key_loss, val_loss in losses.items():
                 # Store the model loss for the track
